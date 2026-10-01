@@ -1,0 +1,247 @@
+name: Release
+
+# Publishing channels, driven by the prerelease part of the version in Cargo.toml:
+#
+#   0.1.0-alpha1  local testing only, never published (and CI is skipped)
+#   0.1.0-beta1   published as a GitHub pre-release
+#   0.1.0         published as a normal release and marked "latest"
+#
+# The tag must always be "v" followed by the exact Cargo.toml version.
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "!v*-alpha*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, for example v0.1.0-beta1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      tag: ${{ steps.read.outputs.tag }}
+      prerelease: ${{ steps.read.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve and verify the version
+        id: read
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          tag="${INPUT_TAG:-${GITHUB_REF_NAME}}"
+
+          echo "Cargo.toml version : $version"
+          echo "tag                : $tag"
+
+          if [[ "$tag" != "v$version" ]]; then
+            echo "::error::Tag '$tag' does not match the Cargo.toml version '$version' (expected 'v$version')."
+            exit 1
+          fi
+
+          if [[ "$version" == *-alpha* ]]; then
+            echo "::error::$version is an alpha version. Alpha builds are for local testing and are never published."
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if [[ "$version" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Publishing $version as a pre-release."
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Publishing $version as a stable release."
+          fi
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: [meta]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: [meta, test]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The plain `landrop-cli-linux-x86_64` name is the static build, so the
+          # file most people download is the one that runs everywhere. A glibc
+          # build is linked against whatever glibc the runner has, and refuses to
+          # start on anything older; a musl build carries its libc with it.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary: target/x86_64-unknown-linux-musl/release/landrop-cli
+            asset: landrop-cli-linux-x86_64
+            packages: musl-tools
+          # Embedded and single-board machines, which is where an always-on
+          # receiver belongs. Cross-linked with zig, and static like the x86_64
+          # musl build, so the same file runs on a Raspberry Pi of either word
+          # size without a distribution's libc underneath it.
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            binary: target/aarch64-unknown-linux-musl/release/landrop-cli
+            asset: landrop-cli-linux-aarch64
+            cross: true
+          - os: ubuntu-24.04
+            target: armv7-unknown-linux-musleabihf
+            binary: target/armv7-unknown-linux-musleabihf/release/landrop-cli
+            asset: landrop-cli-linux-armv7
+            cross: true
+          - os: ubuntu-24.04
+            binary: target/release/landrop-cli
+            asset: landrop-cli-linux-x86_64-gnu
+          - os: windows-latest
+            binary: target/release/landrop-cli.exe
+            asset: landrop-cli-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies
+        if: matrix.packages != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+
+      - name: Install a cross-linker
+        if: matrix.cross
+        run: |
+          python3 -m pip install --user ziglang
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked
+
+      - name: Enable foreign-architecture emulation
+        # Without this the cross-built binaries cannot be executed here, and a
+        # binary that builds but will not run is exactly what the smoke test
+        # below exists to catch.
+        if: matrix.cross
+        uses: docker/setup-qemu-action@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clean before building
+        # Cargo's mtime-based freshness check does not rebuild when only the
+        # version changes, and `cargo clean -p <crate>` does not remove the stale
+        # artefact either. A full clean is the only reliable way to be sure the
+        # published binary was built from this commit.
+        run: cargo clean
+
+      - name: cargo build
+        run: ${{ matrix.cross && 'cargo zigbuild' || 'cargo build' }} --release --locked ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      - name: Confirm the build is what it claims to be
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="${{ matrix.binary }}"
+          # A musl release that quietly fell back to the host libc would still
+          # build and still pass every other check, so the property is asserted
+          # rather than assumed.
+          #
+          # `readelf -d`, not `ldd`: ldd cannot read a foreign-architecture ELF, so
+          # on the cross-built aarch64 and armv7 binaries it fails for a reason
+          # that has nothing to do with linking and reports static builds as
+          # dynamic. It only looked correct on x86_64 because that is the
+          # architecture the runner happens to be.
+          if ! file -b "$binary" | grep -q '^ELF'; then
+            echo "::error::$binary is not an ELF binary"
+            file "$binary"
+            exit 1
+          fi
+          echo "file: $(file -b "$binary")"
+          if readelf -d "$binary" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "::error::the musl build is dynamically linked, so it will not run on an older distribution"
+            readelf -d "$binary"
+            exit 1
+          fi
+          echo "static: no dynamic section"
+
+      - name: Verify the binary reports the expected version
+        shell: bash
+        run: |
+          set -euo pipefail
+          reported=$("${{ matrix.binary }}" --version | awk '{print $2}')
+          expected="${{ needs.meta.outputs.version }}"
+          echo "binary reports : $reported"
+          echo "expected       : $expected"
+          if [[ "$reported" != "$expected" ]]; then
+            echo "::error::Stale build: the binary reports $reported but Cargo.toml declares $expected."
+            exit 1
+          fi
+
+      - name: Smoke test the binary
+        shell: bash
+        run: ${{ matrix.binary }} selftest --size 8388608
+
+      - name: Stage the asset under its published name
+        shell: bash
+        run: cp "${{ matrix.binary }}" "${{ matrix.asset }}"
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [meta, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Collect the built assets
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List what will be published
+        run: ls -l dist
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
+          files: dist/*
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.meta.outputs.prerelease != 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

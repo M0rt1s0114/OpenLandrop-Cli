@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  # Tags are handled by the release workflow, which runs the same tests before
+  # publishing, so running CI on them as well would only duplicate the work.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      active: ${{ steps.read.outputs.active }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the version from Cargo.toml
+        id: read
+        run: |
+          set -euo pipefail
+          # The [package] section comes first, so the first match is the crate version.
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+
+          # Alpha means "work in progress, not ready to be validated": those
+          # commits are for local testing only. Pull requests are always checked.
+          if [[ "$version" == *-alpha* ]]; then
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping CI: $version is an alpha version."
+          else
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  lint:
+    name: Format and lints (${{ matrix.os }})
+    needs: [preflight]
+    if: needs.preflight.outputs.active == 'true' || github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      # Both platforms, because `-D warnings` turns platform-gated dead code into
+      # a build failure and each platform compiles a different half of it. A
+      # helper used only by the Windows firewall module is dead code on Linux, and
+      # one used only by the Linux module is dead code on Windows; a single-runner
+      # lint job only ever sees one of those two.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  msrv:
+    name: Minimum supported Rust version
+    needs: [preflight]
+    if: needs.preflight.outputs.active == 'true' || github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # The toolchain is read from Cargo.toml rather than repeated here, so the
+      # declared MSRV and the one CI exercises cannot drift apart.
+      - name: Install the MSRV declared in Cargo.toml
+        run: |
+          set -euo pipefail
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [[ -z "$msrv" ]]; then
+            echo "::error::Cargo.toml declares no rust-version."
+            exit 1
+          fi
+          echo "declared MSRV: $msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          rustup override set "$msrv"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Building is the check: syntax or a feature newer than the declared MSRV
+      # fails here, instead of surprising someone on an older toolchain.
+      - name: cargo build
+        run: cargo build --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: [preflight]
+    if: needs.preflight.outputs.active == 'true' || github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      - name: End-to-end self test
+        run: cargo run --release --locked -- selftest --size 8388608
+
+  build:
+    name: Build release (${{ matrix.os }})
+    needs: [preflight, lint, test]
+    if: needs.preflight.outputs.active == 'true' || github.event_name == 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: landrop-cli-linux-x86_64
+            binary: target/release/landrop-cli
+          - os: windows-latest
+            artifact: landrop-cli-windows-x86_64
+            binary: target/release/landrop-cli.exe
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --release --locked
+
+      - name: Verify the binary reports the expected version
+        shell: bash
+        run: |
+          set -euo pipefail
+          reported=$("${{ matrix.binary }}" --version | awk '{print $2}')
+          expected="${{ needs.preflight.outputs.version }}"
+          echo "binary reports : $reported"
+          echo "expected       : $expected"
+          if [[ "$reported" != "$expected" ]]; then
+            echo "::error::Stale build: the binary reports $reported but Cargo.toml declares $expected."
+            exit 1
+          fi
+
+      - name: Smoke test the binary
+        shell: bash
+        run: ${{ matrix.binary }} selftest --size 2097152
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}-${{ needs.preflight.outputs.version }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error

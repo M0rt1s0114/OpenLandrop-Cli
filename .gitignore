@@ -1,0 +1,14 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Scratch files are always prefixed with an underscore, so that a log or a
+# one-off probe cannot be committed by accident.
+/_*
+
+# Local runtime state (identity keys, device cache) must never be committed.
+*.key
+landrop-cli.toml
+
+# Commit messages written to a file, so quoting never mangles them.
+.commitmsg*

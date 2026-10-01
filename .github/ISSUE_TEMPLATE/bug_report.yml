@@ -1,0 +1,72 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check the "Not verified" list in the README — some
+        behaviours are known and documented rather than bugs.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+      placeholder: |
+        $ landrop-cli send ./a.bin --to 192.168.1.42:44769
+        expected: ...
+        actual: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-output
+    attributes:
+      label: Output
+      description: Full command output. Add `--json` if you want structured output.
+      render: console
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `landrop-cli --version`
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: peer
+    attributes:
+      label: Peer device and version
+      description: What was on the other end, and which LANDrop version it runs.
+      placeholder: LANDrop v2.7.2 desktop app on Linux
+    validations:
+      required: false
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        If this is a discovery or connection problem, the output of these is
+        useful:
+        ```
+        landrop-cli discover --json
+        landrop-cli identity --json
+        ```
+    validations:
+      required: false
